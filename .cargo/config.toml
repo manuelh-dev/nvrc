@@ -1,4 +1,3 @@
-
 [target.aarch64-unknown-linux-musl]
 rustflags = [
     "-C", "linker=musl-gcc",
@@ -14,9 +13,14 @@ rustflags = [
 rustflags = [
     "-C", "linker=musl-gcc",
     "-C", "target-feature=+crt-static", # Use static crt
-    "-C", "link-arg=-s",                # Strip symbols
     "-C", "opt-level=z",                # Optimize for size
     "-C", "codegen-units=1",            # Enable better (though slower) optimization
     "-C", "panic=abort",                # Remove stack unwind code
+    "-C", "link-arg=-Wl,--wrap=__libc_start_main", # Early log hook
+    "-C", "link-arg=-Wl,--wrap=sysconf", # Trace early sysconf usage
+    "-C", "link-arg=-Wl,--wrap=abort",   # Trace abort path
+    "-C", "link-arg=-Wl,-e,_nvrc_start", # Entrypoint for custom _start
+    "-C", "relocation-model=static",     # Avoid PIE relocations in early _start
+    "-C", "link-arg=-no-pie",            # Force non-PIE for early entry
+    "-C", "debuginfo=1",                # Keep minimal symbols for addr2line
 ]
-

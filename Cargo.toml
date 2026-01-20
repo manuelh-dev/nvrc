@@ -14,9 +14,10 @@ once_cell = "1.21.3"
 
 [profile.release]
 opt-level = "s"
-lto = true
-strip = true
+lto = false
+strip = false
 panic = 'abort'
+debug = 1
 
 [dev-dependencies]
 mktemp = "0.5.1"

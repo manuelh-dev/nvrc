@@ -8,8 +8,10 @@
 
 use crate::macros::ResultExt;
 use nix::sys::reboot::{reboot, RebootMode};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::unistd::sync;
 use std::fs;
+use std::mem;
 use std::panic;
 
 /// Default shutdown action: power off the VM.
@@ -26,12 +28,224 @@ pub fn set_panic_hook() {
     set_panic_hook_with(power_off)
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn raw_write(fd: i64, buf: *const u8, len: usize) {
+    use core::arch::asm;
+    asm!(
+        "syscall",
+        in("rax") 1_i64, // SYS_write
+        in("rdi") fd,
+        in("rsi") buf,
+        in("rdx") len,
+        lateout("rcx") _,
+        lateout("r11") _,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn raw_openat(path: *const u8, flags: i64) -> i64 {
+    use core::arch::asm;
+    let ret: i64;
+    asm!(
+        "syscall",
+        in("rax") 257_i64, // SYS_openat
+        in("rdi") -100_i64, // AT_FDCWD
+        in("rsi") path,
+        in("rdx") flags,
+        in("r10") 0_i64, // mode
+        lateout("rax") ret,
+        lateout("rcx") _,
+        lateout("r11") _,
+    );
+    ret
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn raw_close(fd: i64) {
+    use core::arch::asm;
+    asm!(
+        "syscall",
+        in("rax") 3_i64, // SYS_close
+        in("rdi") fd,
+        lateout("rcx") _,
+        lateout("r11") _,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn raw_write_to_optional_sinks(msg: &[u8]) {
+    let flags = (libc::O_WRONLY | libc::O_CLOEXEC) as i64;
+    for path in [
+        b"/dev/console\0".as_slice(),
+        b"/dev/kmsg\0".as_slice(),
+        b"/dev/ttyS0\0".as_slice(),
+        b"/dev/ttyS1\0".as_slice(),
+        b"/dev/hvc0\0".as_slice(),
+        b"/proc/kmsg\0".as_slice(),
+        b"/proc/self/fd/1\0".as_slice(),
+        b"/proc/self/fd/2\0".as_slice(),
+    ] {
+        let fd = raw_openat(path.as_ptr(), flags);
+        if fd >= 0 {
+            raw_write(fd, msg.as_ptr(), msg.len());
+            raw_close(fd);
+        }
+    }
+}
+
+pub(crate) unsafe fn early_boot_log(msg: &[u8]) {
+    // Avoid libc in early boot: TLS may not be initialized yet.
+    #[cfg(target_arch = "x86_64")]
+    {
+        raw_write(libc::STDOUT_FILENO as i64, msg.as_ptr(), msg.len());
+        raw_write(libc::STDERR_FILENO as i64, msg.as_ptr(), msg.len());
+        raw_write_to_optional_sinks(msg);
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) unsafe fn early_boot_log_num(prefix: &[u8], num: i64) {
+    // Build: "<prefix><num>\n" with no libc usage.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut buf = [0u8; 64];
+        let mut idx = 0usize;
+        for &b in prefix {
+            if idx >= buf.len() {
+                break;
+            }
+            buf[idx] = b;
+            idx += 1;
+        }
+
+        let mut n = num;
+        if n == 0 {
+            if idx < buf.len() {
+                buf[idx] = b'0';
+                idx += 1;
+            }
+        } else {
+            if n < 0 {
+                if idx < buf.len() {
+                    buf[idx] = b'-';
+                    idx += 1;
+                }
+                n = -n;
+            }
+            let mut digits = [0u8; 20];
+            let mut dlen = 0usize;
+            while n > 0 && dlen < digits.len() {
+                digits[dlen] = b'0' + (n % 10) as u8;
+                n /= 10;
+                dlen += 1;
+            }
+            while dlen > 0 && idx < buf.len() {
+                dlen -= 1;
+                buf[idx] = digits[dlen];
+                idx += 1;
+            }
+        }
+
+        if idx < buf.len() {
+            buf[idx] = b'\n';
+            idx += 1;
+        }
+
+        raw_write(libc::STDOUT_FILENO as i64, buf.as_ptr(), idx);
+        raw_write(libc::STDERR_FILENO as i64, buf.as_ptr(), idx);
+        raw_write_to_optional_sinks(&buf[..idx]);
+    }
+}
+
+extern "C" fn fatal_signal_handler(signum: libc::c_int) {
+    let msg: &[u8] = match signum {
+        libc::SIGSEGV => b"NVRC fatal signal: SIGSEGV\n",
+        libc::SIGILL => b"NVRC fatal signal: SIGILL\n",
+        libc::SIGBUS => b"NVRC fatal signal: SIGBUS\n",
+        libc::SIGFPE => b"NVRC fatal signal: SIGFPE\n",
+        libc::SIGABRT => b"NVRC fatal signal: SIGABRT\n",
+        _ => b"NVRC fatal signal: UNKNOWN\n",
+    };
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            raw_write(libc::STDERR_FILENO as i64, msg.as_ptr(), msg.len());
+            // Best-effort additional sinks: async-signal-safe syscalls only.
+            raw_write_to_optional_sinks(msg);
+        }
+        libc::_exit(128 + signum);
+    }
+}
+
+unsafe extern "C" fn early_init() {
+    // Best-effort early marker for visibility before main().
+    let msg = b"NVRC early init: installing signal handlers\n";
+    early_boot_log(msg);
+
+    let mut action: libc::sigaction = mem::zeroed();
+    action.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+    action.sa_sigaction = fatal_signal_handler as usize;
+    libc::sigemptyset(&mut action.sa_mask);
+
+    for signum in [
+        libc::SIGSEGV,
+        libc::SIGILL,
+        libc::SIGBUS,
+        libc::SIGFPE,
+        libc::SIGABRT,
+    ] {
+        let _ = libc::sigaction(signum, &action, std::ptr::null_mut());
+    }
+}
+
+// Run before main() to catch crashes during early runtime init.
+#[used]
+#[cfg_attr(target_os = "linux", link_section = ".preinit_array")]
+static EARLY_INIT: unsafe extern "C" fn() = early_init;
+
+#[allow(dead_code)]
+pub(crate) unsafe fn run_early_init_for_wrapper() {
+    early_init();
+}
+
+/// Install signal handlers for fatal crashes that bypass Rust panics.
+/// These handlers emit a minimal message to stderr and exit with a signal code,
+/// which helps identify early failures (e.g., SIGSEGV/SIGILL) in init.
+pub fn set_signal_handlers() {
+    let action = SigAction::new(
+        SigHandler::Handler(fatal_signal_handler),
+        SaFlags::SA_RESETHAND | SaFlags::SA_NODEFER,
+        SigSet::empty(),
+    );
+    for signal in [
+        Signal::SIGSEGV,
+        Signal::SIGILL,
+        Signal::SIGBUS,
+        Signal::SIGFPE,
+        Signal::SIGABRT,
+    ] {
+        if let Err(err) = unsafe { sigaction(signal, &action) } {
+            panic!("install signal handler {signal}: {err}");
+        }
+    }
+}
+
 /// Internal: panic handler with configurable shutdown (for unit tests).
 /// Production uses power_off(); tests inject a no-op to avoid rebooting.
 fn set_panic_hook_with<F: Fn() + Send + Sync + 'static>(shutdown: F) {
     panic::set_hook(Box::new(move |panic_info| {
-        // fd 1,2 are always available from the kernel
-        eprintln!("panic: {panic_info}");
+        let msg = format!("panic (new): {panic_info}");
+        // Try all available outputs - some may not exist yet during early init
+        // stderr/stdout: always available (fd 1,2 from kernel)
+        eprintln!("panic (original): {panic_info}");
+        eprintln!("eprintl: {msg}");
+        println!("println: {msg}");
+        // /dev/console: may exist from initramfs before devtmpfs mount
+        let _ = fs::write("/dev/console", format!("dev-console: {msg}\n"));
+        // /dev/kmsg: only after devtmpfs mounted, <0> = KERN_EMERG
+        let _ = fs::write("/dev/kmsg", format!("<0> dev-kmsg: {msg}\n"));
+        // Logger: only after kernlog_setup()
+        log::error!("logger-error: {msg}");
         sync();
         shutdown();
     }));
