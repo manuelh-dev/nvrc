@@ -54,13 +54,17 @@ fn setup_at(root: &str) {
     // devtmpfs automatically creates /dev/null, /dev/zero, /dev/random, /dev/urandom
     // Symlinks (/dev/stdin, /dev/stdout, /dev/stderr, /dev/fd, /dev/core) are created by kata-agent
     let dev_flags = MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_RELATIME;
-    mount(
-        "dev",
-        &format!("{root}/dev"),
-        "devtmpfs",
+    // Be forgiving if /dev is already mounted (e.g., initramfs tmpfs).
+    let dev_target = format!("{root}/dev");
+    if let Err(err) = nix::mount::mount(
+        Some("dev"),
+        dev_target.as_str(),
+        Some("devtmpfs"),
         dev_flags,
         Some("mode=0755"),
-    );
+    ) {
+        eprintln!("devtmpfs mount on {} failed: {}", dev_target, err);
+    }
 
     mount("sysfs", &format!("{root}/sys"), "sysfs", common, None);
     mount(
